@@ -154,3 +154,80 @@ class Health(BaseModel):
     status: str
     backend: str
     storage_roots: dict[str, str]
+
+
+# ---- case dossiers -------------------------------------------------------
+class DossierCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=512, description="human case-file name; unique")
+    description: str | None = None
+    # Operator signature stamped onto every audit event this request creates.
+    actor: str = Field(..., min_length=1, max_length=512)
+
+
+class DossierAddMessage(BaseModel):
+    note: str | None = Field(default=None, max_length=100_000)
+    actor: str = Field(..., min_length=1, max_length=512)
+
+
+class DossierUpdateNote(BaseModel):
+    # Explicit null/empty string clears the note; pydantic keeps it as given.
+    note: str | None = Field(default=None, max_length=100_000)
+    actor: str = Field(..., min_length=1, max_length=512)
+
+
+class DossierOut(BaseModel):
+    id: int
+    name: str
+    description: str | None = None
+    created_at: datetime
+    created_by: str
+    message_count: int
+
+
+class IngestSummary(BaseModel):
+    ingest_id: int
+    status: str
+    received_at: datetime
+    source_name: str | None = None
+    raw_sha256: str
+    raw_size: int
+    raw_path: str | None = None
+    fatal_error: str | None = None
+    defect_count: int
+    defects: list[DefectOut] = Field(default_factory=list)
+
+
+class DossierEntryOut(BaseModel):
+    dossier_message_id: int
+    note: str | None = None
+    added_at: datetime
+    added_by: str
+    message: dict[str, Any]
+    ingest: IngestSummary
+
+
+class DossierMessageList(BaseModel):
+    dossier: DossierOut
+    messages: list[DossierEntryOut]
+
+
+class DossierEventOut(BaseModel):
+    id: int
+    dossier_id: int
+    event_type: str
+    message_pk: int | None = None
+    note: str | None = None
+    actor: str
+    occurred_at: datetime
+
+
+class DossierEventList(BaseModel):
+    dossier_id: int
+    count: int
+    events: list[DossierEventOut]
+
+
+class DossierRemoveResult(BaseModel):
+    dossier_id: int
+    message_pk: int
+    removed: bool

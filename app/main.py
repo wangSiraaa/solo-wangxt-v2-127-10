@@ -14,8 +14,21 @@ from fastapi.responses import FileResponse, Response
 from app.config import Settings, get_settings
 from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
-from app.repository import Repository
+from app.repository import (
+    DossierConflict,
+    DossierEntryNotFound,
+    DossierNotFound,
+    MessageNotFound,
+    Repository,
+)
 from app.schemas import (
+    DossierAddMessage,
+    DossierCreate,
+    DossierEventList,
+    DossierMessageList,
+    DossierOut,
+    DossierRemoveResult,
+    DossierUpdateNote,
     FailureOut,
     Health,
     IngestDetail,
@@ -208,6 +221,114 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type=att.get("content_type") or "application/octet-stream",
             filename=safe_name,
         )
+
+    # ---- case dossiers ---------------------------------------------------
+    # Manual legal case files. Membership is explicit only: nothing here
+    # derives from subjects or Message-ID threads, and dossier operations
+    # never modify, copy, or delete messages or attachment bytes.
+    @app.post("/dossiers", response_model=DossierOut, status_code=201, tags=["dossiers"])
+    def create_dossier(request: Request, payload: DossierCreate) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            return repo.create_dossier(
+                payload.name, description=payload.description, actor=payload.actor
+            )
+        except DossierConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.get("/dossiers", response_model=list[DossierOut], tags=["dossiers"])
+    def list_dossiers(
+        request: Request,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        return get_state(request).repo.list_dossiers(limit, offset)
+
+    @app.get("/dossiers/{dossier_id}", response_model=DossierOut, tags=["dossiers"])
+    def get_dossier(request: Request, dossier_id: int) -> dict[str, Any]:
+        dossier = get_state(request).repo.get_dossier(dossier_id)
+        if dossier is None:
+            raise HTTPException(status_code=404, detail="dossier not found")
+        return dossier
+
+    @app.post(
+        "/dossiers/{dossier_id}/messages/{message_pk}",
+        response_model=DossierMessageList,
+        status_code=201,
+        tags=["dossiers"],
+    )
+    def add_dossier_message(
+        request: Request, dossier_id: int, message_pk: int, payload: DossierAddMessage
+    ) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            repo.add_dossier_message(dossier_id, message_pk, note=payload.note, actor=payload.actor)
+        except (DossierNotFound, MessageNotFound) as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except DossierConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return repo.list_dossier_messages(dossier_id)
+
+    @app.delete(
+        "/dossiers/{dossier_id}/messages/{message_pk}",
+        response_model=DossierRemoveResult,
+        tags=["dossiers"],
+    )
+    def remove_dossier_message(
+        request: Request,
+        dossier_id: int,
+        message_pk: int,
+        actor: str = Query(..., min_length=1, max_length=512, description="operator signature"),
+    ) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            return repo.remove_dossier_message(dossier_id, message_pk, actor=actor)
+        except (DossierNotFound, MessageNotFound, DossierEntryNotFound) as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.put(
+        "/dossiers/{dossier_id}/messages/{message_pk}/note",
+        response_model=DossierMessageList,
+        tags=["dossiers"],
+    )
+    def update_dossier_note(
+        request: Request, dossier_id: int, message_pk: int, payload: DossierUpdateNote
+    ) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            repo.update_dossier_note(dossier_id, message_pk, note=payload.note, actor=payload.actor)
+        except (DossierNotFound, MessageNotFound, DossierEntryNotFound) as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return repo.list_dossier_messages(dossier_id)
+
+    @app.get(
+        "/dossiers/{dossier_id}/messages",
+        response_model=DossierMessageList,
+        tags=["dossiers"],
+    )
+    def list_dossier_messages(request: Request, dossier_id: int) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            return repo.list_dossier_messages(dossier_id)
+        except DossierNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get(
+        "/dossiers/{dossier_id}/events",
+        response_model=DossierEventList,
+        tags=["dossiers"],
+    )
+    def list_dossier_events(
+        request: Request,
+        dossier_id: int,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            return repo.list_dossier_events(dossier_id, limit, offset)
+        except DossierNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
 
     @app.get("/health", response_model=Health, tags=["meta"])
     def health(request: Request) -> Health:

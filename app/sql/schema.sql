@@ -119,3 +119,45 @@ CREATE TABLE IF NOT EXISTS thread_runs (
 
 -- Provenance link: raw EML digest -> every ingest/parse result of that bytes.
 CREATE INDEX IF NOT EXISTS idx_ingests_sha ON ingests(raw_sha256);
+
+-- Case dossiers: manual, human-curated collections of messages.
+-- A dossier is NOT a thread: membership is explicit only, never derived from
+-- subjects or Message-ID references. Rows here reference messages but never
+-- mutate or duplicate them; removing a membership leaves the original message,
+-- its thread assignment, and its attachment bytes untouched.
+CREATE TABLE IF NOT EXISTS dossiers (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by      TEXT NOT NULL
+);
+-- Dossier names identify a human case file; forbid confusing duplicates.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dossiers_name ON dossiers(name);
+
+CREATE TABLE IF NOT EXISTS dossier_messages (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dossier_id      BIGINT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+    message_pk      BIGINT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT,
+    note            TEXT,
+    added_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    added_by        TEXT NOT NULL,
+    UNIQUE (dossier_id, message_pk)
+);
+CREATE INDEX IF NOT EXISTS idx_dmsg_message ON dossier_messages(message_pk);
+
+-- Append-only audit trail of membership / note changes. Nothing here is ever
+-- updated or deleted: a removal is recorded as a 'removed' event while the
+-- membership row is deleted, so the full history survives membership churn.
+CREATE TABLE IF NOT EXISTS dossier_events (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dossier_id      BIGINT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+    event_type      TEXT NOT NULL CHECK (event_type IN
+                        ('created','added','removed','note_updated')),
+    message_pk      BIGINT REFERENCES messages(id) ON DELETE SET NULL,
+    note            TEXT,
+    actor           TEXT NOT NULL,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_doss_events_dossier ON dossier_events(dossier_id, id);
+

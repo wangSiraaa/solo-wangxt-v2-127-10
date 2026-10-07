@@ -11,6 +11,12 @@ from typing import Any, Sequence
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.repository import (
+    DossierConflict,
+    DossierEntryNotFound,
+    DossierNotFound,
+    MessageNotFound,
+)
 from app.threads import ThreadInput, compute_threads
 
 
@@ -28,9 +34,15 @@ class MemoryRepository:
         self.attachments: list[dict[str, Any]] = []
         self.defects: list[dict[str, Any]] = []
         self.thread_runs: list[dict[str, Any]] = []
+        self.dossiers: dict[int, dict[str, Any]] = {}
+        self.dossier_messages: list[dict[str, Any]] = []
+        self.dossier_events: list[dict[str, Any]] = []
         self._ingest_seq = 0
         self._msg_seq = 0
         self._att_seq = 0
+        self._dossier_seq = 0
+        self._dmsg_seq = 0
+        self._devent_seq = 0
 
     def init_schema(self) -> None:  # nothing to do
         return None
@@ -326,3 +338,198 @@ class MemoryRepository:
             if a["id"] == attachment_id:
                 return dict(a)
         return None
+
+    def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None:
+        for a in self.attachments:
+            if a["id"] == attachment_id and a["message_pk"] == message_pk:
+                return dict(a)
+        return None
+
+    # -- case dossiers -----------------------------------------------------
+    def _require_dossier(self, dossier_id: int) -> dict[str, Any]:
+        dossier = self.dossiers.get(dossier_id)
+        if dossier is None:
+            raise DossierNotFound(f"dossier {dossier_id} not found")
+        return dossier
+
+    def _require_message(self, message_pk: int) -> dict[str, Any]:
+        message = self.messages.get(message_pk)
+        if message is None:
+            raise MessageNotFound(f"message {message_pk} not found")
+        return message
+
+    def _find_entry(self, dossier_id: int, message_pk: int) -> dict[str, Any] | None:
+        for e in self.dossier_messages:
+            if e["dossier_id"] == dossier_id and e["message_pk"] == message_pk:
+                return e
+        return None
+
+    def _dossier_view(self, dossier: dict[str, Any]) -> dict[str, Any]:
+        count = sum(1 for e in self.dossier_messages if e["dossier_id"] == dossier["id"])
+        return {
+            "id": dossier["id"],
+            "name": dossier["name"],
+            "description": dossier["description"],
+            "created_at": dossier["created_at"],
+            "created_by": dossier["created_by"],
+            "message_count": count,
+        }
+
+    def _record_event(
+        self,
+        dossier_id: int,
+        event_type: str,
+        *,
+        message_pk: int | None,
+        note: str | None,
+        actor: str,
+    ) -> None:
+        self._devent_seq += 1
+        self.dossier_events.append(
+            {
+                "id": self._devent_seq,
+                "dossier_id": dossier_id,
+                "event_type": event_type,
+                "message_pk": message_pk,
+                "note": note,
+                "actor": actor,
+                "occurred_at": datetime.now(timezone.utc),
+            }
+        )
+
+    def _ingest_summary_for(self, message_pk: int) -> dict[str, Any]:
+        m = self.messages[message_pk]
+        ing = self.ingests[m["ingest_id"]]
+        defects = [d for d in self.defects if d["ingest_id"] == ing["id"]]
+        return {
+            "ingest_id": ing["id"],
+            "status": ing["status"],
+            "received_at": ing["received_at"],
+            "source_name": ing["source_name"],
+            "raw_sha256": ing["raw_sha256"],
+            "raw_size": ing["raw_size"],
+            "raw_path": ing["raw_path"],
+            "fatal_error": ing["fatal_error"],
+            "defect_count": len(defects),
+            "defects": [
+                {"stage": d["stage"], "level": d["level"], "message": d["message"]}
+                for d in defects
+            ],
+        }
+
+    def create_dossier(self, name: str, *, description: str | None, actor: str) -> dict[str, Any]:
+        if any(d["name"] == name for d in self.dossiers.values()):
+            raise DossierConflict(f"dossier name already exists: {name!r}")
+        self._dossier_seq += 1
+        dossier_id = self._dossier_seq
+        self.dossiers[dossier_id] = {
+            "id": dossier_id,
+            "name": name,
+            "description": description,
+            "created_at": datetime.now(timezone.utc),
+            "created_by": actor,
+        }
+        self._record_event(dossier_id, "created", message_pk=None, note=None, actor=actor)
+        return self.get_dossier(dossier_id)  # type: ignore[return-value]
+
+    def get_dossier(self, dossier_id: int) -> dict[str, Any] | None:
+        dossier = self.dossiers.get(dossier_id)
+        if dossier is None:
+            return None
+        return self._dossier_view(dossier)
+
+    def list_dossiers(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        ordered = sorted(self.dossiers.values(), key=lambda d: d["id"], reverse=True)
+        return [self._dossier_view(d) for d in ordered[offset : offset + limit]]
+
+    def add_dossier_message(
+        self, dossier_id: int, message_pk: int, *, note: str | None, actor: str
+    ) -> dict[str, Any]:
+        self._require_dossier(dossier_id)
+        self._require_message(message_pk)
+        if self._find_entry(dossier_id, message_pk) is not None:
+            raise DossierConflict(
+                f"message {message_pk} is already in dossier {dossier_id}"
+            )
+        self._dmsg_seq += 1
+        entry = {
+            "id": self._dmsg_seq,
+            "dossier_id": dossier_id,
+            "message_pk": message_pk,
+            "note": note,
+            "added_at": datetime.now(timezone.utc),
+            "added_by": actor,
+        }
+        self.dossier_messages.append(entry)
+        self._record_event(dossier_id, "added", message_pk=message_pk, note=note, actor=actor)
+        return dict(entry)
+
+    def remove_dossier_message(self, dossier_id: int, message_pk: int, *, actor: str) -> dict[str, Any]:
+        self._require_dossier(dossier_id)
+        self._require_message(message_pk)
+        entry = self._find_entry(dossier_id, message_pk)
+        if entry is None:
+            raise DossierEntryNotFound(
+                f"message {message_pk} is not in dossier {dossier_id}"
+            )
+        self.dossier_messages = [
+            e for e in self.dossier_messages if e["id"] != entry["id"]
+        ]
+        self._record_event(dossier_id, "removed", message_pk=message_pk, note=None, actor=actor)
+        return {"dossier_id": dossier_id, "message_pk": message_pk, "removed": True}
+
+    def update_dossier_note(
+        self, dossier_id: int, message_pk: int, *, note: str | None, actor: str
+    ) -> dict[str, Any]:
+        self._require_dossier(dossier_id)
+        self._require_message(message_pk)
+        entry = self._find_entry(dossier_id, message_pk)
+        if entry is None:
+            raise DossierEntryNotFound(
+                f"message {message_pk} is not in dossier {dossier_id}"
+            )
+        if entry["note"] != note:
+            entry["note"] = note
+            self._record_event(
+                dossier_id, "note_updated", message_pk=message_pk, note=note, actor=actor
+            )
+        return dict(entry)
+
+    def list_dossier_messages(self, dossier_id: int) -> dict[str, Any]:
+        dossier = self._require_dossier(dossier_id)
+        entries = sorted(
+            (e for e in self.dossier_messages if e["dossier_id"] == dossier_id),
+            key=lambda e: (e["added_at"], e["id"]),
+        )
+        items = []
+        for e in entries:
+            m = self.messages[e["message_pk"]]
+            items.append(
+                {
+                    "dossier_message_id": e["id"],
+                    "note": e["note"],
+                    "added_at": e["added_at"],
+                    "added_by": e["added_by"],
+                    "message": self._summary(m),
+                    "ingest": self._ingest_summary_for(m["id"]),
+                }
+            )
+        return {"dossier": self._dossier_view(dossier), "messages": items}
+
+    def list_dossier_events(self, dossier_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        self._require_dossier(dossier_id)
+        events = [
+            {
+                "id": e["id"],
+                "dossier_id": e["dossier_id"],
+                "event_type": e["event_type"],
+                "message_pk": e["message_pk"],
+                "note": e["note"],
+                "actor": e["actor"],
+                "occurred_at": e["occurred_at"],
+            }
+            for e in sorted(self.dossier_events, key=lambda x: x["id"], reverse=True)
+            if e["dossier_id"] == dossier_id
+        ]
+        page = events[offset : offset + limit]
+        return {"dossier_id": dossier_id, "count": len(events), "events": page}

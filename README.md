@@ -49,6 +49,41 @@ Implemented in `app/threads.py` (pure function, unit tested):
 * Reference cycles are detected with bounded three-color DFS (`cycles`);
   dangling references (`dangling_references`) are reported, not hidden.
 
+## Case dossiers (manual legal collections)
+
+Dossiers are **human-curated case files**, orthogonal to the derived
+conversations above. They live in `dossiers` / `dossier_messages` /
+`dossier_events` and obey hard separation rules:
+
+* **Not a thread.** Membership is explicit API action only. Same subject,
+  matching `Message-ID`, or any other header fact never auto-adds a message.
+* **No copy / no delete.** A dossier only holds a `(dossier_id, message_pk)`
+  link plus a free-text per-membership **note**. Adding or removing a link
+  never modifies the message, its `thread_key`, its raw EML, or attachment
+  bytes. After removal, search, attachment download, and thread membership are
+  exactly as before.
+* **Multi-valued.** The same message can belong to many dossiers; each link
+  has its **own independent note** (`UNIQUE(dossier_id, message_pk)` only
+  forbids the exact same pair twice, returning `409`).
+* **Signed history.** Every create/add/note-change/remove appends an immutable
+  `dossier_events` row carrying `event_type`, `occurred_at`, the operator
+  (`actor`), and the note value at the time of the event. Removing a link
+  deletes the membership row but keeps the `removed` event, so the full
+  history survives churn.
+
+The memory and PostgreSQL repositories expose identical behavior; dossier
+relations and history persist across restarts on PostgreSQL.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/dossiers` | create a dossier (`name` unique, `actor` required) |
+| GET | `/dossiers` / `/dossiers/{id}` | list / dossier detail (with `message_count`) |
+| POST | `/dossiers/{id}/messages/{pk}` | add a message with optional `note` (`actor` required) |
+| DELETE | `/dossiers/{id}/messages/{pk}?actor=` | remove the link only; original data untouched |
+| PUT | `/dossiers/{id}/messages/{pk}/note` | replace the per-link note (`actor` required) |
+| GET | `/dossiers/{id}/messages` | members with message summary **and original ingest summary** |
+| GET | `/dossiers/{id}/events` | newest-first change history (timestamped, signed) |
+
 ## API
 
 | Method | Path | Purpose |
@@ -61,6 +96,7 @@ Implemented in `app/threads.py` (pure function, unit tested):
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
 | GET | `/ingests/{id}` | provenance: raw digest/path + every defect located by stage |
 | GET | `/failures` | failed/defective ingests with their defect lists |
+| POST/GET `/dossiers`, `…/messages/{pk}`, `…/events` | manual case files: curate links + notes, audited (see above) |
 | GET | `/health` | backend and configured storage roots |
 
 ## Running
@@ -91,7 +127,7 @@ ls samples/
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest                       # 47 unit + API tests (memory backend)
+.venv/bin/python -m pytest                       # unit + API tests (memory backend)
 EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/tmp/pgsock&port=55432' \
   .venv/bin/python -m pytest                     # + real PostgreSQL integration tests
 ```
@@ -114,11 +150,11 @@ app/
     models.py          structured result dataclasses
   storage.py           ControlledStorage (path safety, 0600, metadata logs)
   threads.py           Message-ID graph + cycles + conflicts + weak subjects
-  pg_repository.py     PostgreSQL persistence (psycopg3)
-  memory_repository.py same interface, in-memory (tests / demo)
+  pg_repository.py     PostgreSQL persistence (psycopg3) + case dossiers
+  memory_repository.py same interface, in-memory (tests / demo) + case dossiers
   service.py           parse -> store -> persist -> thread orchestration
   main.py / schemas.py FastAPI app and response models
-  sql/schema.sql       DDL (ids intentionally non-unique)
+  sql/schema.sql       DDL (ids intentionally non-unique; dossier tables + audit)
 scripts/generate_samples.py
 samples/               generated edge-case EML files
 tests/                 unit, API and PostgreSQL integration tests

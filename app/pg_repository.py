@@ -11,6 +11,12 @@ from psycopg.types.json import Jsonb
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.repository import (
+    DossierConflict,
+    DossierEntryNotFound,
+    DossierNotFound,
+    MessageNotFound,
+)
 from app.threads import ThreadInput, compute_threads
 
 _SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
@@ -373,6 +379,310 @@ class PgRepository:
                 return None
             cols = [c.name for c in cur.description]
             return _jsonify(dict(zip(cols, row)))
+
+    def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM attachments WHERE id = %s AND message_pk = %s",
+                (attachment_id, message_pk),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [c.name for c in cur.description]
+            return _jsonify(dict(zip(cols, row)))
+
+    # -- case dossiers -----------------------------------------------------
+    def create_dossier(self, name: str, *, description: str | None, actor: str) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO dossiers (name, description, created_by)
+                    VALUES (%s, %s, %s)
+                    RETURNING id, name, description, created_at, created_by
+                    """,
+                    (name, description, actor),
+                )
+            except psycopg.errors.UniqueViolation as exc:
+                raise DossierConflict(f"dossier name already exists: {name!r}") from exc
+            row = cur.fetchone()
+            cols = [c.name for c in cur.description]
+            dossier = dict(zip(cols, row))
+            dossier_id = dossier["id"]
+            cur.execute(
+                """
+                INSERT INTO dossier_events (dossier_id, event_type, message_pk, note, actor)
+                VALUES (%s, 'created', NULL, NULL, %s)
+                """,
+                (dossier_id, actor),
+            )
+            conn.commit()
+        dossier["message_count"] = 0
+        return _jsonify(dossier)
+
+    def get_dossier(self, dossier_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT d.id, d.name, d.description, d.created_at, d.created_by,
+                       (SELECT count(*) FROM dossier_messages dm
+                         WHERE dm.dossier_id = d.id) AS message_count
+                FROM dossiers d WHERE d.id = %s
+                """,
+                (dossier_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [c.name for c in cur.description]
+            return _jsonify(dict(zip(cols, row)))
+
+    def list_dossiers(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT d.id, d.name, d.description, d.created_at, d.created_by,
+                       (SELECT count(*) FROM dossier_messages dm
+                         WHERE dm.dossier_id = d.id) AS message_count
+                FROM dossiers d
+                ORDER BY d.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
+            cols = [c.name for c in cur.description]
+            return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+
+    def _dossier_exists(self, cur, dossier_id: int) -> bool:
+        cur.execute("SELECT 1 FROM dossiers WHERE id = %s", (dossier_id,))
+        return cur.fetchone() is not None
+
+    def _message_exists(self, cur, message_pk: int) -> bool:
+        cur.execute("SELECT 1 FROM messages WHERE id = %s", (message_pk,))
+        return cur.fetchone() is not None
+
+    def _fetch_entry(self, cur, dossier_id: int, message_pk: int) -> dict[str, Any] | None:
+        cur.execute(
+            """
+            SELECT id, dossier_id, message_pk, note, added_at, added_by
+            FROM dossier_messages
+            WHERE dossier_id = %s AND message_pk = %s
+            """,
+            (dossier_id, message_pk),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [c.name for c in cur.description]
+        return _jsonify(dict(zip(cols, row)))
+
+    def add_dossier_message(
+        self, dossier_id: int, message_pk: int, *, note: str | None, actor: str
+    ) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            if not self._dossier_exists(cur, dossier_id):
+                raise DossierNotFound(f"dossier {dossier_id} not found")
+            if not self._message_exists(cur, message_pk):
+                raise MessageNotFound(f"message {message_pk} not found")
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO dossier_messages (dossier_id, message_pk, note, added_by)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, dossier_id, message_pk, note, added_at, added_by
+                    """,
+                    (dossier_id, message_pk, note, actor),
+                )
+            except psycopg.errors.UniqueViolation as exc:
+                raise DossierConflict(
+                    f"message {message_pk} is already in dossier {dossier_id}"
+                ) from exc
+            row = cur.fetchone()
+            cols = [c.name for c in cur.description]
+            cur.execute(
+                """
+                INSERT INTO dossier_events (dossier_id, event_type, message_pk, note, actor)
+                VALUES (%s, 'added', %s, %s, %s)
+                """,
+                (dossier_id, message_pk, note, actor),
+            )
+            conn.commit()
+            return _jsonify(dict(zip(cols, row)))
+
+    def remove_dossier_message(self, dossier_id: int, message_pk: int, *, actor: str) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            if not self._dossier_exists(cur, dossier_id):
+                raise DossierNotFound(f"dossier {dossier_id} not found")
+            if not self._message_exists(cur, message_pk):
+                raise MessageNotFound(f"message {message_pk} not found")
+            entry = self._fetch_entry(cur, dossier_id, message_pk)
+            if entry is None:
+                raise DossierEntryNotFound(
+                    f"message {message_pk} is not in dossier {dossier_id}"
+                )
+            cur.execute(
+                "DELETE FROM dossier_messages WHERE dossier_id = %s AND message_pk = %s",
+                (dossier_id, message_pk),
+            )
+            cur.execute(
+                """
+                INSERT INTO dossier_events (dossier_id, event_type, message_pk, note, actor)
+                VALUES (%s, 'removed', %s, NULL, %s)
+                """,
+                (dossier_id, message_pk, actor),
+            )
+            conn.commit()
+        return {"dossier_id": dossier_id, "message_pk": message_pk, "removed": True}
+
+    def update_dossier_note(
+        self, dossier_id: int, message_pk: int, *, note: str | None, actor: str
+    ) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            if not self._dossier_exists(cur, dossier_id):
+                raise DossierNotFound(f"dossier {dossier_id} not found")
+            if not self._message_exists(cur, message_pk):
+                raise MessageNotFound(f"message {message_pk} not found")
+            entry = self._fetch_entry(cur, dossier_id, message_pk)
+            if entry is None:
+                raise DossierEntryNotFound(
+                    f"message {message_pk} is not in dossier {dossier_id}"
+                )
+            if entry["note"] != note:
+                cur.execute(
+                    """
+                    UPDATE dossier_messages SET note = %s
+                    WHERE dossier_id = %s AND message_pk = %s
+                    """,
+                    (note, dossier_id, message_pk),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO dossier_events (dossier_id, event_type, message_pk, note, actor)
+                    VALUES (%s, 'note_updated', %s, %s, %s)
+                    """,
+                    (dossier_id, message_pk, note, actor),
+                )
+            cur.execute(
+                """
+                SELECT id, dossier_id, message_pk, note, added_at, added_by
+                FROM dossier_messages
+                WHERE dossier_id = %s AND message_pk = %s
+                """,
+                (dossier_id, message_pk),
+            )
+            row = cur.fetchone()
+            cols = [c.name for c in cur.description]
+            conn.commit()
+            return _jsonify(dict(zip(cols, row)))
+
+    def list_dossier_messages(self, dossier_id: int) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, description, created_at, created_by FROM dossiers WHERE id = %s",
+                (dossier_id,),
+            )
+            drow = cur.fetchone()
+            if not drow:
+                raise DossierNotFound(f"dossier {dossier_id} not found")
+            dcols = [c.name for c in cur.description]
+            dossier = dict(zip(dcols, drow))
+            cur.execute(
+                """
+                SELECT dm.id AS dossier_message_id, dm.note, dm.added_at, dm.added_by,
+                       m.id, m.message_id, m.subject, m.date, m.from_json, m.thread_key,
+                       m.raw_sha256, m.missing_id, m.ingest_id,
+                       i.id AS ingest_id, i.status, i.received_at, i.source_name,
+                       i.raw_sha256 AS ingest_raw_sha256, i.raw_size, i.raw_path,
+                       i.fatal_error,
+                       (SELECT count(*) FROM defects d WHERE d.ingest_id = i.id) AS defect_count,
+                       (SELECT jsonb_agg(jsonb_build_object('stage', d.stage, 'level', d.level,
+                                                            'message', d.message) ORDER BY d.id)
+                          FROM defects d WHERE d.ingest_id = i.id) AS defects
+                FROM dossier_messages dm
+                JOIN messages m ON m.id = dm.message_pk
+                JOIN ingests i ON i.id = m.ingest_id
+                WHERE dm.dossier_id = %s
+                ORDER BY dm.added_at ASC, dm.id ASC
+                """,
+                (dossier_id,),
+            )
+            rows = cur.fetchall()
+            # Result columns: 4 entry cols, then the 9 message columns, then
+            # the 10 ingest columns (ingest first, defects last).
+            msg_cols = [
+                "id",
+                "message_id",
+                "subject",
+                "date",
+                "from_json",
+                "thread_key",
+                "raw_sha256",
+                "missing_id",
+                "ingest_id",
+            ]
+            ing_cols = [
+                "ingest_id",
+                "status",
+                "received_at",
+                "source_name",
+                "raw_sha256",
+                "raw_size",
+                "raw_path",
+                "fatal_error",
+                "defect_count",
+                "defects",
+            ]
+            items = []
+            for r in rows:
+                entry = {
+                    "dossier_message_id": r[0],
+                    "note": r[1],
+                    "added_at": r[2],
+                    "added_by": r[3],
+                }
+                message = dict(zip(msg_cols, r[4:13]))
+                ingest = dict(zip(ing_cols, r[13:23]))
+                if ingest["defects"] is None:
+                    ingest["defects"] = []
+                items.append(
+                    _jsonify(
+                        {
+                            **entry,
+                            "message": message,
+                            "ingest": ingest,
+                        }
+                    )
+                )
+            cur.execute(
+                "SELECT count(*) FROM dossier_messages WHERE dossier_id = %s",
+                (dossier_id,),
+            )
+            dossier["message_count"] = cur.fetchone()[0]
+        return {"dossier": _jsonify(dossier), "messages": items}
+
+    def list_dossier_events(self, dossier_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            if not self._dossier_exists(cur, dossier_id):
+                raise DossierNotFound(f"dossier {dossier_id} not found")
+            cur.execute(
+                "SELECT count(*) FROM dossier_events WHERE dossier_id = %s",
+                (dossier_id,),
+            )
+            total = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT id, dossier_id, event_type, message_pk, note, actor, occurred_at
+                FROM dossier_events
+                WHERE dossier_id = %s
+                ORDER BY id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (dossier_id, limit, offset),
+            )
+            cols = [c.name for c in cur.description]
+            events = _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+        return {"dossier_id": dossier_id, "count": total, "events": events}
 
 
 def _jsonify(value: Any) -> Any:

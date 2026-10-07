@@ -65,3 +65,19 @@ def pg_client(tmp_path, pg_dsn):
     app = create_app(_settings(tmp_path, pg_dsn))
     with TestClient(app) as c:
         yield c, app.state.arch
+
+
+def pytest_generate_tests(metafunc):
+    """Params: docket tests run once on memory and once on PostgreSQL."""
+    if "any_client" in metafunc.fixturenames:
+        metafunc.parametrize("any_client", ["memory", "postgresql"], indirect=True)
+
+
+@pytest.fixture
+def any_client(request, tmp_path, pg_dsn):
+    if request.param == "postgresql":
+        app = create_app(_settings(tmp_path, pg_dsn))
+    else:
+        app = create_app(_settings(tmp_path, None))
+    with TestClient(app) as c:
+        yield c, app.state.arch

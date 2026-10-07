@@ -11,6 +11,12 @@ from typing import Any, Sequence
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.repository import (
+    DocketEntryConflict,
+    DocketEntryNotFound,
+    DocketNotFound,
+    MessageNotFound,
+)
 from app.threads import ThreadInput, compute_threads
 
 
@@ -28,9 +34,15 @@ class MemoryRepository:
         self.attachments: list[dict[str, Any]] = []
         self.defects: list[dict[str, Any]] = []
         self.thread_runs: list[dict[str, Any]] = []
+        self.dockets: dict[int, dict[str, Any]] = {}
+        self.docket_entries: list[dict[str, Any]] = []
+        self.docket_events: list[dict[str, Any]] = []
         self._ingest_seq = 0
         self._msg_seq = 0
         self._att_seq = 0
+        self._docket_seq = 0
+        self._entry_seq = 0
+        self._event_seq = 0
 
     def init_schema(self) -> None:  # nothing to do
         return None
@@ -326,3 +338,173 @@ class MemoryRepository:
             if a["id"] == attachment_id:
                 return dict(a)
         return None
+
+    # -- case dockets ------------------------------------------------------
+    def _ingest_summary_for(self, pk: int) -> dict[str, Any] | None:
+        m = self.messages.get(pk)
+        if not m:
+            return None
+        ing = self.ingests.get(m["ingest_id"])
+        if not ing:
+            return None
+        return {
+            "id": ing["id"],
+            "received_at": ing["received_at"],
+            "source_name": ing["source_name"],
+            "status": ing["status"],
+            "raw_sha256": ing["raw_sha256"],
+            "raw_size": ing["raw_size"],
+            "raw_path": ing["raw_path"],
+            "defect_count": ing["defect_count"],
+        }
+
+    def _entry_out(self, e: dict[str, Any]) -> dict[str, Any]:
+        m = self.messages.get(e["message_pk"])
+        return {
+            "id": e["id"],
+            "docket_id": e["docket_id"],
+            "message_pk": e["message_pk"],
+            "note": e["note"],
+            "added_by": e["added_by"],
+            "added_at": e["added_at"],
+            "message": self._summary(m) if m else None,
+            "ingest": self._ingest_summary_for(e["message_pk"]),
+        }
+
+    def _docket_out(self, d: dict[str, Any]) -> dict[str, Any]:
+        entries = [
+            self._entry_out(e)
+            for e in self.docket_entries
+            if e["docket_id"] == d["id"] and e["removed_at"] is None
+        ]
+        entries.sort(key=lambda x: (x["added_at"], x["id"]), reverse=True)
+        return {
+            "id": d["id"],
+            "name": d["name"],
+            "description": d["description"],
+            "created_by": d["created_by"],
+            "created_at": d["created_at"],
+            "message_count": len(entries),
+            "entries": entries,
+        }
+
+    def _require_docket(self, docket_id: int) -> dict[str, Any]:
+        d = self.dockets.get(docket_id)
+        if d is None:
+            raise DocketNotFound(docket_id)
+        return d
+
+    def _active_entry(self, docket_id: int, message_pk: int) -> dict[str, Any] | None:
+        for e in self.docket_entries:
+            if (
+                e["docket_id"] == docket_id
+                and e["message_pk"] == message_pk
+                and e["removed_at"] is None
+            ):
+                return e
+        return None
+
+    def _record_event(
+        self,
+        docket_id: int,
+        action: str,
+        actor: str,
+        *,
+        message_pk: int | None = None,
+        note: str | None = None,
+    ) -> None:
+        self._event_seq += 1
+        self.docket_events.append(
+            {
+                "id": self._event_seq,
+                "docket_id": docket_id,
+                "message_pk": message_pk,
+                "action": action,
+                "note": note,
+                "actor": actor,
+                "occurred_at": datetime.now(timezone.utc),
+            }
+        )
+
+    def create_docket(self, name: str, description: str | None, actor: str) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        self._docket_seq += 1
+        docket_id = self._docket_seq
+        self.dockets[docket_id] = {
+            "id": docket_id,
+            "name": name,
+            "description": description,
+            "created_by": actor,
+            "created_at": now,
+        }
+        self._record_event(docket_id, "created", actor)
+        return self._docket_out(self.dockets[docket_id])
+
+    def get_docket(self, docket_id: int) -> dict[str, Any] | None:
+        d = self.dockets.get(docket_id)
+        return self._docket_out(d) if d else None
+
+    def list_dockets(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        ordered = sorted(self.dockets.values(), key=lambda x: x["id"], reverse=True)
+        return [self._docket_out(d) for d in ordered[offset : offset + limit]]
+
+    def add_docket_entry(
+        self, docket_id: int, message_pk: int, note: str | None, actor: str
+    ) -> dict[str, Any]:
+        self._require_docket(docket_id)
+        if message_pk not in self.messages:
+            raise MessageNotFound(message_pk)
+        if self._active_entry(docket_id, message_pk) is not None:
+            raise DocketEntryConflict(f"message {message_pk} already in docket {docket_id}")
+        now = datetime.now(timezone.utc)
+        self._entry_seq += 1
+        entry = {
+            "id": self._entry_seq,
+            "docket_id": docket_id,
+            "message_pk": message_pk,
+            "note": note,
+            "added_by": actor,
+            "added_at": now,
+            "removed_at": None,
+            "removed_by": None,
+        }
+        self.docket_entries.append(entry)
+        self._record_event(docket_id, "added", actor, message_pk=message_pk, note=note)
+        return self._entry_out(entry)
+
+    def update_docket_entry_note(
+        self, docket_id: int, message_pk: int, note: str | None, actor: str
+    ) -> dict[str, Any]:
+        self._require_docket(docket_id)
+        entry = self._active_entry(docket_id, message_pk)
+        if entry is None:
+            raise DocketEntryNotFound(
+                f"message {message_pk} is not an active member of docket {docket_id}"
+            )
+        entry["note"] = note
+        self._record_event(docket_id, "note_updated", actor, message_pk=message_pk, note=note)
+        return self._entry_out(entry)
+
+    def remove_docket_entry(self, docket_id: int, message_pk: int, actor: str) -> dict[str, Any]:
+        self._require_docket(docket_id)
+        entry = self._active_entry(docket_id, message_pk)
+        if entry is None:
+            raise DocketEntryNotFound(
+                f"message {message_pk} is not an active member of docket {docket_id}"
+            )
+        entry["removed_at"] = datetime.now(timezone.utc)
+        entry["removed_by"] = actor
+        self._record_event(docket_id, "removed", actor, message_pk=message_pk, note=entry["note"])
+        return {
+            "docket_id": docket_id,
+            "message_pk": message_pk,
+            "removed": True,
+            "removed_by": actor,
+            "removed_at": entry["removed_at"],
+        }
+
+    def list_docket_events(self, docket_id: int, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        self._require_docket(docket_id)
+        events = [dict(e) for e in self.docket_events if e["docket_id"] == docket_id]
+        events.sort(key=lambda x: (x["occurred_at"], x["id"]), reverse=True)
+        return events[offset : offset + limit]

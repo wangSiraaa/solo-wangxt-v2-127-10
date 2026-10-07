@@ -15,7 +15,21 @@ from app.config import Settings, get_settings
 from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
 from app.repository import Repository
+from app.repository import (
+    DocketEntryConflict,
+    DocketEntryNotFound,
+    DocketNotFound,
+    MessageNotFound,
+)
 from app.schemas import (
+    DocketCreate,
+    DocketDetail,
+    DocketEntryAdd,
+    DocketEventOut,
+    DocketNotePatch,
+    DocketRemovalOut,
+    DocketRemove,
+    DocketSummary,
     FailureOut,
     Health,
     IngestDetail,
@@ -208,6 +222,103 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type=att.get("content_type") or "application/octet-stream",
             filename=safe_name,
         )
+
+    # ---- case dockets ----------------------------------------------------
+    # Manual curation for legal case folders. These endpoints only create and
+    # edit relation rows; they never modify messages, threads, ingests or raw
+    # bytes, and membership is never inferred from subjects/Message-IDs.
+    @app.post("/dockets", response_model=DocketDetail, status_code=201, tags=["dockets"])
+    def create_docket(request: Request, body: DocketCreate) -> dict[str, Any]:
+        return get_state(request).repo.create_docket(body.name, body.description, body.actor)
+
+    @app.get("/dockets", response_model=list[DocketSummary], tags=["dockets"])
+    def list_dockets(
+        request: Request,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        return get_state(request).repo.list_dockets(limit, offset)
+
+    @app.get("/dockets/{docket_id}", response_model=DocketDetail, tags=["dockets"])
+    def get_docket(request: Request, docket_id: int) -> dict[str, Any]:
+        docket = get_state(request).repo.get_docket(docket_id)
+        if docket is None:
+            raise HTTPException(status_code=404, detail="docket not found")
+        return docket
+
+    @app.put(
+        "/dockets/{docket_id}/entries",
+        response_model=DocketDetail,
+        status_code=201,
+        tags=["dockets"],
+    )
+    def add_docket_entry(request: Request, docket_id: int, body: DocketEntryAdd) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            repo.add_docket_entry(docket_id, body.message_pk, body.note, body.actor)
+        except DocketNotFound:
+            raise HTTPException(status_code=404, detail="docket not found")
+        except MessageNotFound:
+            raise HTTPException(status_code=404, detail="message not found")
+        except DocketEntryConflict:
+            raise HTTPException(
+                status_code=409, detail="message is already an active member of this docket"
+            )
+        docket = repo.get_docket(docket_id)
+        assert docket is not None
+        return docket
+
+    @app.patch(
+        "/dockets/{docket_id}/entries/{message_pk}/note",
+        response_model=DocketDetail,
+        tags=["dockets"],
+    )
+    def patch_docket_note(
+        request: Request, docket_id: int, message_pk: int, body: DocketNotePatch
+    ) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            repo.update_docket_entry_note(docket_id, message_pk, body.note, body.actor)
+        except DocketNotFound:
+            raise HTTPException(status_code=404, detail="docket not found")
+        except DocketEntryNotFound:
+            raise HTTPException(status_code=404, detail="docket entry not found")
+        docket = repo.get_docket(docket_id)
+        assert docket is not None
+        return docket
+
+    @app.delete(
+        "/dockets/{docket_id}/entries/{message_pk}",
+        response_model=DocketRemovalOut,
+        tags=["dockets"],
+    )
+    def remove_docket_entry(
+        request: Request, docket_id: int, message_pk: int, body: DocketRemove
+    ) -> dict[str, Any]:
+        repo = get_state(request).repo
+        try:
+            return repo.remove_docket_entry(docket_id, message_pk, body.actor)
+        except DocketNotFound:
+            raise HTTPException(status_code=404, detail="docket not found")
+        except DocketEntryNotFound:
+            raise HTTPException(status_code=404, detail="docket entry not found")
+
+    @app.get(
+        "/dockets/{docket_id}/history",
+        response_model=list[DocketEventOut],
+        tags=["dockets"],
+    )
+    def docket_history(
+        request: Request,
+        docket_id: int,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        repo = get_state(request).repo
+        try:
+            return repo.list_docket_events(docket_id, limit, offset)
+        except DocketNotFound:
+            raise HTTPException(status_code=404, detail="docket not found")
 
     @app.get("/health", response_model=Health, tags=["meta"])
     def health(request: Request) -> Health:

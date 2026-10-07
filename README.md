@@ -49,6 +49,35 @@ Implemented in `app/threads.py` (pure function, unit tested):
 * Reference cycles are detected with bounded three-color DFS (`cycles`);
   dangling references (`dangling_references`) are reported, not hidden.
 
+## Case dockets (manual legal curation)
+
+Dockets are **human-maintained** collections of mail for a legal case. They are
+not threads: a message joins a docket only through an explicit operator action,
+never from a matching subject or `Message-ID` graph.
+
+* Docket membership is a pure relation row. Creating/removing a membership
+  never modifies the original message, its headers, its thread assignment, the
+  stored raw EML or attachment bytes — nothing is copied or deleted.
+* The same message can belong to any number of dockets, and the per-membership
+  note belongs to the `(docket, message)` pair, so notes are independent.
+* Removal is a soft delete: the membership row is end-dated and full history is
+  retained; the same message can be re-added later as a fresh membership.
+* Every change (`created` / `added` / `note_updated` / `removed`) records an
+  **operator signature** (`actor`, required, trimmed) and a server timestamp.
+* Each docket entry lists the message summary together with the summary of the
+  message's **original ingest** (raw digest, size, path, status, defects).
+* The in-memory and PostgreSQL backends implement identical behavior; docket
+  rows and history persist across restarts in PostgreSQL.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/dockets` | create a docket (`name`, `description?`, `actor`) |
+| GET | `/dockets` / `/dockets/{id}` | list / docket with active entries + ingest summaries |
+| PUT | `/dockets/{id}/entries` | add a message with a note (`message_pk`, `note?`, `actor`); `409` if already a member |
+| PATCH | `/dockets/{id}/entries/{message_pk}/note` | replace that membership's note (`note?`, `actor`) |
+| DELETE | `/dockets/{id}/entries/{message_pk}` | remove the membership (`actor`); message/thread/bytes untouched |
+| GET | `/dockets/{id}/history` | change audit trail, newest first (`action`, `note`, `actor`, `occurred_at`) |
+
 ## API
 
 | Method | Path | Purpose |
@@ -59,6 +88,10 @@ Implemented in `app/threads.py` (pure function, unit tested):
 | GET | `/search?q=` | substring over subject, Message-ID, all header values, body plain text |
 | GET | `/threads` / `/threads/{key}` | thread summaries / ordered members with reference headers |
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
+| POST | `/dockets` | create a manual case docket |
+| GET | `/dockets` / `/dockets/{id}` | docket list / docket entries with each original ingest summary |
+| PUT/PATCH/DELETE | `/dockets/{id}/entries…` | add message+note, edit note, remove membership (all require `actor`) |
+| GET | `/dockets/{id}/history` | append-only membership change audit (timestamp + operator) |
 | GET | `/ingests/{id}` | provenance: raw digest/path + every defect located by stage |
 | GET | `/failures` | failed/defective ingests with their defect lists |
 | GET | `/health` | backend and configured storage roots |
@@ -91,10 +124,14 @@ ls samples/
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest                       # 47 unit + API tests (memory backend)
+.venv/bin/python -m pytest                       # unit + API tests (memory backend)
 EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/tmp/pgsock&port=55432' \
   .venv/bin/python -m pytest                     # + real PostgreSQL integration tests
 ```
+
+Docket tests (`tests/test_dockets.py`) run against both backends; a
+PostgreSQL-only test also verifies docket relations and change history survive
+a full application restart against the same database.
 
 ### Quick manual check
 
@@ -114,11 +151,11 @@ app/
     models.py          structured result dataclasses
   storage.py           ControlledStorage (path safety, 0600, metadata logs)
   threads.py           Message-ID graph + cycles + conflicts + weak subjects
-  pg_repository.py     PostgreSQL persistence (psycopg3)
+  pg_repository.py     PostgreSQL persistence (psycopg3; dockets + audit events)
   memory_repository.py same interface, in-memory (tests / demo)
   service.py           parse -> store -> persist -> thread orchestration
-  main.py / schemas.py FastAPI app and response models
-  sql/schema.sql       DDL (ids intentionally non-unique)
+  main.py / schemas.py FastAPI app, request/response models, docket routes
+  sql/schema.sql       DDL (ids intentionally non-unique; case_docket* tables)
 scripts/generate_samples.py
 samples/               generated edge-case EML files
 tests/                 unit, API and PostgreSQL integration tests

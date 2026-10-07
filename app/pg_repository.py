@@ -11,6 +11,12 @@ from psycopg.types.json import Jsonb
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.repository import (
+    DocketEntryConflict,
+    DocketEntryNotFound,
+    DocketNotFound,
+    MessageNotFound,
+)
 from app.threads import ThreadInput, compute_threads
 
 _SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
@@ -373,6 +379,267 @@ class PgRepository:
                 return None
             cols = [c.name for c in cur.description]
             return _jsonify(dict(zip(cols, row)))
+
+    # -- case dockets ------------------------------------------------------
+    def create_docket(self, name: str, description: str | None, actor: str) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO case_dockets (name, description, created_by)
+                VALUES (%s,%s,%s) RETURNING id, created_at
+                """,
+                (name, description, actor),
+            )
+            docket_id, created_at = cur.fetchone()
+            cur.execute(
+                """
+                INSERT INTO case_docket_events (docket_id, message_pk, action, note, actor)
+                VALUES (%s, NULL, 'created', NULL, %s)
+                """,
+                (docket_id, actor),
+            )
+            conn.commit()
+        out = self.get_docket(docket_id)
+        assert out is not None
+        return out
+
+    def get_docket(self, docket_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, description, created_by, created_at
+                FROM case_dockets WHERE id = %s
+                """,
+                (docket_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            docket = {
+                "id": row[0],
+                "name": row[1],
+                "description": row[2],
+                "created_by": row[3],
+                "created_at": row[4],
+            }
+            cur.execute(
+                """
+                SELECT e.id, e.docket_id, e.message_pk, e.note, e.added_by, e.added_at,
+                       m.id, m.message_id, m.subject, m.date, m.from_json,
+                       m.thread_key, m.raw_sha256, m.missing_id, m.ingest_id,
+                       i.id, i.received_at, i.source_name, i.status,
+                       i.raw_sha256, i.raw_size, i.raw_path, i.defect_count
+                FROM case_docket_entries e
+                JOIN messages m ON m.id = e.message_pk
+                JOIN ingests i ON i.id = m.ingest_id
+                WHERE e.docket_id = %s AND e.removed_at IS NULL
+                ORDER BY e.added_at DESC, e.id DESC
+                """,
+                (docket_id,),
+            )
+            entries = []
+            for r in cur.fetchall():
+                entries.append(
+                    {
+                        "id": r[0],
+                        "docket_id": r[1],
+                        "message_pk": r[2],
+                        "note": r[3],
+                        "added_by": r[4],
+                        "added_at": r[5],
+                        "message": {
+                            "id": r[6],
+                            "message_id": r[7],
+                            "subject": r[8],
+                            "date": r[9],
+                            "from_json": r[10],
+                            "thread_key": r[11],
+                            "raw_sha256": r[12],
+                            "missing_id": r[13],
+                            "ingest_id": r[14],
+                        },
+                        "ingest": {
+                            "id": r[15],
+                            "received_at": r[16],
+                            "source_name": r[17],
+                            "status": r[18],
+                            "raw_sha256": r[19],
+                            "raw_size": r[20],
+                            "raw_path": r[21],
+                            "defect_count": r[22],
+                        },
+                    }
+                )
+            docket["message_count"] = len(entries)
+            docket["entries"] = _jsonify(entries)
+            return _jsonify(docket)
+
+    def list_dockets(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT d.id, d.name, d.description, d.created_by, d.created_at,
+                       (SELECT count(*) FROM case_docket_entries e
+                         WHERE e.docket_id = d.id AND e.removed_at IS NULL) AS message_count
+                FROM case_dockets d
+                ORDER BY d.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
+            rows = cur.fetchall()
+            return _jsonify(
+                [
+                    {
+                        "id": r[0],
+                        "name": r[1],
+                        "description": r[2],
+                        "created_by": r[3],
+                        "created_at": r[4],
+                        "message_count": r[5],
+                    }
+                    for r in rows
+                ]
+            )
+
+    def add_docket_entry(
+        self, docket_id: int, message_pk: int, note: str | None, actor: str
+    ) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM case_dockets WHERE id = %s", (docket_id,))
+            if cur.fetchone() is None:
+                raise DocketNotFound(docket_id)
+            cur.execute("SELECT 1 FROM messages WHERE id = %s", (message_pk,))
+            if cur.fetchone() is None:
+                raise MessageNotFound(message_pk)
+            cur.execute("SELECT now()")
+            now = cur.fetchone()[0]
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO case_docket_entries
+                        (docket_id, message_pk, note, added_by, added_at)
+                    VALUES (%s,%s,%s,%s,%s)
+                    RETURNING id
+                    """,
+                    (docket_id, message_pk, note, actor, now),
+                )
+            except psycopg.errors.UniqueViolation:
+                raise DocketEntryConflict(
+                    f"message {message_pk} already in docket {docket_id}"
+                ) from None
+            cur.execute(
+                """
+                INSERT INTO case_docket_events
+                    (docket_id, message_pk, action, note, actor, occurred_at)
+                VALUES (%s,%s,'added',%s,%s,%s)
+                """,
+                (docket_id, message_pk, note, actor, now),
+            )
+            conn.commit()
+        out = self.get_docket(docket_id)
+        assert out is not None
+        return next(e for e in out["entries"] if e["message_pk"] == message_pk)
+
+    def update_docket_entry_note(
+        self, docket_id: int, message_pk: int, note: str | None, actor: str
+    ) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE case_docket_entries SET note = %s
+                WHERE docket_id = %s AND message_pk = %s AND removed_at IS NULL
+                RETURNING id
+                """,
+                (note, docket_id, message_pk),
+            )
+            if cur.fetchone() is None:
+                cur.execute("SELECT 1 FROM case_dockets WHERE id = %s", (docket_id,))
+                if cur.fetchone() is None:
+                    raise DocketNotFound(docket_id)
+                raise DocketEntryNotFound(
+                    f"message {message_pk} is not an active member of docket {docket_id}"
+                )
+            cur.execute(
+                """
+                INSERT INTO case_docket_events (docket_id, message_pk, action, note, actor)
+                VALUES (%s,%s,'note_updated',%s,%s)
+                """,
+                (docket_id, message_pk, note, actor),
+            )
+            conn.commit()
+        out = self.get_docket(docket_id)
+        assert out is not None
+        return next(e for e in out["entries"] if e["message_pk"] == message_pk)
+
+    def remove_docket_entry(self, docket_id: int, message_pk: int, actor: str) -> dict[str, Any]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM case_dockets WHERE id = %s", (docket_id,))
+            if cur.fetchone() is None:
+                raise DocketNotFound(docket_id)
+            cur.execute("SELECT now()")
+            now = cur.fetchone()[0]
+            cur.execute(
+                """
+                UPDATE case_docket_entries
+                   SET removed_at = %s, removed_by = %s
+                 WHERE docket_id = %s AND message_pk = %s AND removed_at IS NULL
+                RETURNING note
+                """,
+                (now, actor, docket_id, message_pk),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise DocketEntryNotFound(
+                    f"message {message_pk} is not an active member of docket {docket_id}"
+                )
+            cur.execute(
+                """
+                INSERT INTO case_docket_events
+                    (docket_id, message_pk, action, note, actor, occurred_at)
+                VALUES (%s,%s,'removed',%s,%s,%s)
+                """,
+                (docket_id, message_pk, row[0], actor, now),
+            )
+            conn.commit()
+        return {
+            "docket_id": docket_id,
+            "message_pk": message_pk,
+            "removed": True,
+            "removed_by": actor,
+            "removed_at": now,
+        }
+
+    def list_docket_events(self, docket_id: int, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM case_dockets WHERE id = %s", (docket_id,))
+            if cur.fetchone() is None:
+                raise DocketNotFound(docket_id)
+            cur.execute(
+                """
+                SELECT id, docket_id, message_pk, action, note, actor, occurred_at
+                FROM case_docket_events
+                WHERE docket_id = %s
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (docket_id, limit, offset),
+            )
+            rows = cur.fetchall()
+            return _jsonify(
+                [
+                    {
+                        "id": r[0],
+                        "docket_id": r[1],
+                        "message_pk": r[2],
+                        "action": r[3],
+                        "note": r[4],
+                        "actor": r[5],
+                        "occurred_at": r[6],
+                    }
+                    for r in rows
+                ]
+            )
 
 
 def _jsonify(value: Any) -> Any:

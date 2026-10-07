@@ -119,3 +119,46 @@ CREATE TABLE IF NOT EXISTS thread_runs (
 
 -- Provenance link: raw EML digest -> every ingest/parse result of that bytes.
 CREATE INDEX IF NOT EXISTS idx_ingests_sha ON ingests(raw_sha256);
+
+-- ---------------------------------------------------------------------------
+-- Case dockets: *manual* curation of messages into legal case folders.
+-- These rows are pure relations. They never modify messages/threads/ingests,
+-- they never copy or delete original content, and membership is never derived
+-- from subjects or threading headers — a message joins a docket only via an
+-- explicit operator action.
+CREATE TABLE IF NOT EXISTS case_dockets (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    created_by      TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS case_docket_entries (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    docket_id       BIGINT NOT NULL REFERENCES case_dockets(id) ON DELETE CASCADE,
+    message_pk      BIGINT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT,
+    note            TEXT,
+    added_by        TEXT NOT NULL,
+    added_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    removed_at      TIMESTAMPTZ,
+    removed_by      TEXT
+);
+-- One *active* membership per (docket, message). Removed rows are untouched
+-- (re-adding after removal creates a fresh row, so both stays keep history).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_docket_active_entry
+    ON case_docket_entries(docket_id, message_pk) WHERE removed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_docket_entries_docket ON case_docket_entries(docket_id, added_at DESC);
+CREATE INDEX IF NOT EXISTS idx_docket_entries_message ON case_docket_entries(message_pk);
+
+CREATE TABLE IF NOT EXISTS case_docket_events (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    docket_id       BIGINT NOT NULL REFERENCES case_dockets(id) ON DELETE CASCADE,
+    message_pk      BIGINT REFERENCES messages(id) ON DELETE SET NULL,
+    action          TEXT NOT NULL CHECK (action IN
+                        ('created','added','note_updated','removed')),
+    note            TEXT,
+    actor           TEXT NOT NULL,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_docket_events_docket ON case_docket_events(docket_id, occurred_at DESC, id DESC);
